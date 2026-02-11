@@ -87,25 +87,28 @@ fn parse_path(path: &Path, text: &str, filter: &FileFilter) -> anyhow::Result<Ve
 }
 
 fn looks_like_sarif(text: &str) -> bool {
-    text.contains("\"version\"") && text.contains("\"runs\"")
+    text.contains("\"version\"") && text.contains("\"runs\"") && text.contains("\"tool\"")
 }
 
 fn looks_like_eslint(text: &str) -> bool {
-    text.trim_start().starts_with('[') && text.contains("\"messages\"")
+    text.trim_start().starts_with('[')
+        && text.contains("\"filePath\"")
+        && text.contains("\"messages\"")
 }
 
 fn looks_like_semgrep(text: &str) -> bool {
-    text.contains("\"results\"") && text.contains("\"check_id\"")
+    text.contains("\"results\"") && text.contains("\"check_id\"") && text.contains("\"path\"")
 }
 
 fn looks_like_checkov(text: &str) -> bool {
-    text.contains("\"check_type\"")
-        || text.contains("\"failed_checks\"")
-        || text.contains("\"check_id\"") && text.contains("\"file_path\"")
+    (text.contains("\"check_type\"") || text.contains("\"failed_checks\""))
+        && (text.contains("\"check_id\"") || text.contains("\"file_path\""))
 }
 
 fn looks_like_gitleaks(text: &str) -> bool {
-    text.contains("\"RuleID\"") || text.contains("\"Description\"") && text.contains("\"File\"")
+    (text.contains("\"RuleID\"") || text.contains("\"Rules\""))
+        && text.contains("\"File\"")
+        && (text.contains("\"StartLine\"") || text.contains("\"EndLine\""))
 }
 
 fn looks_like_clippy_jsonl(text: &str) -> bool {
@@ -544,6 +547,7 @@ mod tests {
         let body = r#"{
           "version":"2.1.0",
           "runs":[{
+            "tool":{"driver":{"name":"test-tool"}},
             "results":[{
               "ruleId":"x",
               "level":"warning",
@@ -623,15 +627,16 @@ mod tests {
     }
 
     #[test]
-    fn fails_on_malformed_detected_format() {
+    fn fails_on_malformed_checkov_format() {
+        // Checkov JSON that looks valid but has malformed body
         let file = unique_temp_file("checkov-bad", "json");
-        let body = r#"{"check_type":"terraform","results":}"#;
+        let body = r#"{"check_type":"terraform","results":{"failed_checks":[{"check_id":"x"}]}"#;
         std::fs::write(&file, body).expect("write fixture");
 
         let filter = crate::filtering::FileFilter::from_config(&FilterConfig::default())
             .expect("filter build");
         let err = ingest_external_findings(std::slice::from_ref(&file), &filter)
-            .expect_err("malformed detected format should fail");
+            .expect_err("malformed Checkov JSON should fail");
 
         let _ = std::fs::remove_file(&file);
         assert!(err.to_string().contains("detected as Checkov JSON"));
@@ -646,6 +651,22 @@ mod tests {
             .expect("filter build");
         let err = ingest_external_findings(std::slice::from_ref(&file), &filter)
             .expect_err("unsupported ingest should fail");
+
+        let _ = std::fs::remove_file(&file);
+        assert!(err.to_string().contains("unsupported ingest format"));
+    }
+
+    #[test]
+    fn fails_on_unrecognizable_json_format() {
+        // JSON that doesn't match any known format pattern
+        let file = unique_temp_file("unknown-json", "json");
+        let body = r#"{"foo":"bar","baz":"qux"}"#;
+        std::fs::write(&file, body).expect("write fixture");
+
+        let filter = crate::filtering::FileFilter::from_config(&FilterConfig::default())
+            .expect("filter build");
+        let err = ingest_external_findings(std::slice::from_ref(&file), &filter)
+            .expect_err("unrecognized format should fail");
 
         let _ = std::fs::remove_file(&file);
         assert!(err.to_string().contains("unsupported ingest format"));

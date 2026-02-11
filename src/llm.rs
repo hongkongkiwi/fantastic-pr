@@ -163,6 +163,8 @@ struct LlmFinding {
     evidence: Option<Vec<String>>,
 }
 
+/// Maximum characters per diff line entry in LLM prompts.
+/// Chosen to balance context window usage vs. providing sufficient code context.
 const MAX_LINE_CHARS_PER_PROMPT_ENTRY: usize = 320;
 const EMBEDDED_PROMPT_CORE_SYSTEM: &str = include_str!("../prompts/core_system.txt");
 const EMBEDDED_PROMPT_MODE_PR: &str = include_str!("../prompts/mode_pr.txt");

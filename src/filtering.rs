@@ -128,6 +128,11 @@ fn is_lockfile(path: &str) -> bool {
         || path.ends_with("pnpm-lock.yaml")
         || path.ends_with("yarn.lock")
         || path.ends_with("Cargo.lock")
+        || path.ends_with("composer.lock")
+        || path.ends_with("Gemfile.lock")
+        || path.ends_with("poetry.lock")
+        || path.ends_with("packages.lock.json")
+        || path.ends_with("go.sum")
 }
 
 fn source_ext(path: &str) -> Option<&str> {
@@ -178,7 +183,7 @@ fn is_reviewable_name(path: &str) -> bool {
 mod tests {
     use crate::config::FilterConfig;
 
-    use super::FileFilter;
+    use super::{FileFilter, normalize};
 
     #[test]
     fn filter_excludes_generated_files() {
@@ -197,5 +202,17 @@ mod tests {
 
         assert!(filter.is_reviewable_file("src/foo/mod.rs"));
         assert!(!filter.is_reviewable_file("scripts/tool.py"));
+    }
+
+    #[test]
+    fn normalize_handles_windows_paths() {
+        // Windows paths use backslashes
+        assert_eq!(normalize("src\\main.rs"), "src/main.rs");
+        assert_eq!(normalize("foo\\bar\\baz.txt"), "foo/bar/baz.txt");
+    }
+
+    #[test]
+    fn normalize_handles_mixed_separators() {
+        assert_eq!(normalize("src/foo\\bar/baz"), "src/foo/bar/baz");
     }
 }

@@ -79,7 +79,7 @@ pub fn parse_unified_diff(input: &str) -> anyhow::Result<DiffData> {
             current_new_line = caps
                 .get(1)
                 .and_then(|m| m.as_str().parse::<usize>().ok())
-                .unwrap_or(0);
+                .unwrap_or(1);
             continue;
         }
 

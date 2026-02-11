@@ -63,9 +63,9 @@ pub fn run_checks(
     let debug_re = Regex::new(
         r"\b(dbg!\s*\(|println!\s*\(|eprintln!\s*\(|console\.log\s*\(|fmt\.Print(?:ln|f)?\s*\(|printStackTrace\s*\()",
     )?;
-    let aws_key_re = Regex::new(r"\bAKIA[0-9A-Z]{16}\b")?;
+    let aws_key_re = Regex::new(r"\bA[KS]IA[0-9A-Z]{16}\b")?;
     let generic_secret_re =
-        Regex::new(r#"(?i)\b(api[_-]?key|secret|password|token)\b\s*[:=]\s*["'][^"']{8,}["']"#)?;
+        Regex::new(r#"(?i)\b(api[_-]?key|secret|password|token)\b\s*[:=;]\s*["'][^"']{8,}["']"#)?;
     let unwrap_re = Regex::new(r"\.unwrap\s*\(\s*\)")?;
     let iac_open_cidr_re = Regex::new(r#"(?i)\b(cidr_blocks?|source_ranges?)\b.*0\.0\.0\.0/0"#)?;
     let iac_public_re =
@@ -391,8 +391,7 @@ fn has_test_changes(diff: &DiffData, filter: &FileFilter) -> bool {
 
 fn is_test_path(path: &str) -> bool {
     let lower = path.to_lowercase();
-    lower == "tests"
-        || lower.starts_with("tests/")
+    lower.starts_with("tests/")
         || lower.contains("/tests/")
         || lower.contains("/__tests__/")
         || lower.starts_with("__tests__/")
@@ -401,9 +400,15 @@ fn is_test_path(path: &str) -> bool {
         || lower.ends_with(".test.ts")
         || lower.ends_with(".test.tsx")
         || lower.ends_with(".test.js")
+        || lower.ends_with(".test.java")
         || lower.ends_with(".spec.ts")
         || lower.ends_with(".spec.tsx")
         || lower.ends_with(".spec.js")
+        || lower.ends_with(".spec.java")
+        || lower.ends_with(".mock.ts")
+        || lower.ends_with(".mock.tsx")
+        || lower.ends_with(".mock.js")
+        || lower.ends_with("__mocks__")
 }
 
 fn is_iac_path(path: &str) -> bool {
@@ -411,8 +416,10 @@ fn is_iac_path(path: &str) -> bool {
     lower.ends_with(".tf")
         || lower.ends_with(".tfvars")
         || lower.ends_with(".hcl")
+        || lower.ends_with(".nomad")
         || lower.ends_with(".yaml")
         || lower.ends_with(".yml")
+        || lower.contains("cdk.tf.json")
         || lower.contains("/helm/")
         || lower.contains("/k8s/")
         || lower.contains("/manifests/")
@@ -673,7 +680,7 @@ diff --git a/tests/lib.rs b/tests/lib.rs
     }
 
     #[test]
-    fn detects_iac_misconfig_patterns() {
+    fn detects_iac_open_network_privileged_and_unpinned_image_patterns() {
         let diff = r#"diff --git a/infra/main.tf b/infra/main.tf
 --- a/infra/main.tf
 +++ b/infra/main.tf

@@ -1,6 +1,18 @@
 use crate::checks::{Finding, Severity};
 
 pub fn findings_to_sarif(findings: &[Finding]) -> serde_json::Value {
+    // Build unique rule set for SARIF output
+    let rules: std::collections::HashSet<_> = findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "id": f.rule,
+                "name": f.rule,
+                "shortDescription": { "text": f.title }
+            })
+        })
+        .collect();
+
     let results = findings
         .iter()
         .map(|f| {
@@ -37,8 +49,8 @@ pub fn findings_to_sarif(findings: &[Finding]) -> serde_json::Value {
             "tool": {
                 "driver": {
                     "name": "fantastic-pr",
-                    "informationUri": "https://github.com",
-                    "rules": []
+                    "informationUri": "https://github.com/hongkongkiwi/fantastic-pr",
+                    "rules": rules.into_iter().collect::<Vec<_>>()
                 }
             },
             "results": results
@@ -113,6 +125,12 @@ mod tests {
         );
         assert!(results[1].get("locations").is_none());
         assert!(results[2].get("locations").is_none());
+
+        // Check that rules array is populated with unique rules
+        let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .expect("rules must be an array");
+        assert_eq!(rules.len(), 4); // 4 unique rules from findings
     }
 
     #[test]
@@ -132,5 +150,29 @@ mod tests {
             sarif["runs"][0]["results"][0]["message"]["text"],
             "Readable title: specific details"
         );
+    }
+
+    #[test]
+    fn handles_findings_without_file_or_line() {
+        // Finding with only rule and details (no location)
+        let findings = vec![Finding {
+            rule: "no-location-rule".to_string(),
+            title: "No location".to_string(),
+            details: "This finding has no file or line".to_string(),
+            severity: Severity::Warning,
+            file: None,
+            line: None,
+            suggestion: None,
+        }];
+
+        let sarif = findings_to_sarif(&findings);
+        let results = sarif["runs"][0]["results"]
+            .as_array()
+            .expect("results must be an array");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["ruleId"], "no-location-rule");
+        // Should not have locations when file/line are missing
+        assert!(results[0].get("locations").is_none());
     }
 }
