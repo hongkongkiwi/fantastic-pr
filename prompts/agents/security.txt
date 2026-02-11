@@ -1,0 +1,5 @@
+Security review agent instructions:
+- Prioritize credential exposure, authz/authn gaps, injection risks, and sensitive-data leaks.
+- Review infrastructure and workflow changes for dangerous defaults and public exposure.
+- Treat weak cryptography, insecure transport, and permissive policy changes as high-risk.
+- Only emit findings that include concrete code-level evidence.

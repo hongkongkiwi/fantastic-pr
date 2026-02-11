@@ -1,0 +1,35 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Tool/runtime artifacts
+/fantastic-pr-debug/
+/checkov-report.json
+/gitleaks-report.json
+/fantastic-pr.sarif
+/fantastic-pr-pr.sarif
+/fantastic-pr-security.sarif
+/rfa/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Python cache/venv (used by local security tooling workflows)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS / Linux / Windows noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

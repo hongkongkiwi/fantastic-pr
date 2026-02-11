@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Return JSON only. No markdown, code fences, or prose before/after the JSON object.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["findings"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "rule",
+          "severity",
+          "title",
+          "details",
+          "file",
+          "line",
+          "confidence",
+          "suggestion",
+          "evidence"
+        ],
+        "properties": {
+          "rule": { "type": "string", "minLength": 1 },
+          "severity": {
+            "type": "string",
+            "enum": ["info", "warning", "error", "critical"]
+          },
+          "title": { "type": "string", "minLength": 1 },
+          "details": { "type": "string", "minLength": 1 },
+          "file": { "type": ["string", "null"] },
+          "line": { "type": ["integer", "null"], "minimum": 1 },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Required confidence estimate in [0,1], never null."
+          },
+          "suggestion": { "type": ["string", "null"] },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  }
+}

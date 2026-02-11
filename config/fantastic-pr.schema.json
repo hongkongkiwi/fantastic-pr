@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/fantastic-pr.schema.json",
+  "title": "Fantastic PR Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "profile": { "type": "string" },
+    "inheritance": { "type": "boolean" },
+    "extends": { "type": ["string", "null"] },
+    "max_reported_findings": { "type": "integer", "minimum": 1 },
+    "max_examples_per_rule": { "type": "integer", "minimum": 1 },
+    "max_inline_comments": { "type": "integer", "minimum": 1 },
+    "large_pr_added_lines_threshold": { "type": "integer", "minimum": 1 },
+    "missing_tests_added_lines_threshold": { "type": "integer", "minimum": 1 },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "todo_comments": { "type": "boolean" },
+        "debug_statements": { "type": "boolean" },
+        "secret_patterns": { "type": "boolean" },
+        "large_pr": { "type": "boolean" },
+        "missing_tests": { "type": "boolean" },
+        "unsafe_rust": { "type": "boolean" },
+        "unwrap_usage": { "type": "boolean" },
+        "iac_misconfig": { "type": "boolean" }
+      }
+    },
+    "pre_merge_checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "todo_comments": { "$ref": "#/$defs/checkMode" },
+        "debug_statements": { "$ref": "#/$defs/checkMode" },
+        "secret_patterns": { "$ref": "#/$defs/checkMode" },
+        "large_pr": { "$ref": "#/$defs/checkMode" },
+        "missing_tests": { "$ref": "#/$defs/checkMode" },
+        "unsafe_rust": { "$ref": "#/$defs/checkMode" },
+        "unwrap_usage": { "$ref": "#/$defs/checkMode" },
+        "iac_misconfig": { "$ref": "#/$defs/checkMode" }
+      }
+    },
+    "llm": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "provider": { "type": "string" },
+        "base_url": { "type": "string" },
+        "model": { "type": "string" },
+        "api_key_env": { "type": "string" },
+        "cli_command": { "type": "string" },
+        "cli_args": { "type": "array", "items": { "type": "string" } },
+        "fallback_models": { "type": "array", "items": { "type": "string" } },
+        "fallback_providers": { "type": "array", "items": { "type": "string" } },
+        "agents": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/llmAgent" }
+        },
+        "prompt_core_file": { "type": "string" },
+        "prompt_pr_file": { "type": "string" },
+        "prompt_scan_file": { "type": "string" },
+        "prompt_output_contract_file": { "type": "string" },
+        "max_prompt_chars": { "type": "integer", "minimum": 512 },
+        "max_findings": { "type": "integer", "minimum": 1 },
+        "max_chunks": { "type": "integer", "minimum": 1 },
+        "provider_timeout_secs": { "type": "integer", "minimum": 1 },
+        "min_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "pr_changed_lines_only": { "type": "boolean" },
+        "workflow_strategy": { "$ref": "#/$defs/llmWorkflowStrategy" },
+        "consensus_min_support": { "type": "integer", "minimum": 1 },
+        "judge_model": { "type": ["string", "null"] },
+        "judge_prompt_file": { "type": "string", "minLength": 1 },
+        "judge_max_candidates": { "type": "integer", "minimum": 1 },
+        "debate_prompt_file": { "type": "string", "minLength": 1 },
+        "critique_revise_prompt_file": { "type": "string", "minLength": 1 }
+      }
+    },
+    "reviews": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "auto_review": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "include_drafts": { "type": "boolean" },
+            "labels": { "type": "array", "items": { "type": "string" } },
+            "exclude_labels": { "type": "array", "items": { "type": "string" } },
+            "title_keywords": { "type": "array", "items": { "type": "string" } },
+            "base_branches": { "type": "array", "items": { "type": "string" } },
+            "ignore_usernames": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "path_instructions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["paths", "instructions"],
+            "properties": {
+              "name": { "type": ["string", "null"] },
+              "paths": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+              "instructions": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sarif": { "$ref": "#/$defs/toolInput" },
+        "eslint": { "$ref": "#/$defs/toolInput" },
+        "semgrep": { "$ref": "#/$defs/toolInput" },
+        "checkov": { "$ref": "#/$defs/toolInput" },
+        "gitleaks": { "$ref": "#/$defs/toolInput" },
+        "clippy": { "$ref": "#/$defs/toolInput" }
+      }
+    },
+    "filters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "include_globs": { "type": "array", "items": { "type": "string" } },
+        "exclude_globs": { "type": "array", "items": { "type": "string" } },
+        "ignore_file": { "type": "string" }
+      }
+    },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "file": { "type": "string" },
+        "update": { "type": "boolean" }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "initial_pr_scope": { "type": "string" },
+        "sync_scope": { "type": "string" },
+        "manual_scope": { "type": "string" }
+      }
+    },
+    "debug": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "upload_failed_provider_artifacts": { "type": "boolean" },
+        "artifact_dir": { "type": "string" }
+      }
+    }
+  },
+  "$defs": {
+    "checkMode": {
+      "type": "string",
+      "enum": ["off", "warning", "error", "inherit"]
+    },
+    "toolInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "paths": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "llmAgent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "enabled", "focus"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "enabled": { "type": "boolean" },
+        "focus": { "type": "string" },
+        "prompt_file": { "type": ["string", "null"] },
+        "provider": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "min_confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+      }
+    },
+    "llmWorkflowStrategy": {
+      "type": "string",
+      "enum": ["merge", "consensus", "judge", "judge-consensus", "debate", "critique-revise"]
+    }
+  }
+}

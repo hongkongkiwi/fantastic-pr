@@ -1,0 +1,173 @@
+name: Fantastic PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, closed]
+  workflow_dispatch: {}
+
+concurrency:
+  group: fantastic-pr-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests & Coverage
+    if: github.event_name != 'pull_request' || (github.event.action != 'closed' && github.event.action != 'converted_to_draft' && (github.event.pull_request.draft == false || vars.FANTASTIC_PR_INCLUDE_DRAFTS == 'true'))
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run Test Suite (All Targets)
+        run: just test-all
+
+      - name: Enforce Coverage Thresholds
+        run: just coverage-check
+
+  pr_review:
+    name: PR Review (Diff)
+    needs: tests
+    if: github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.action != 'converted_to_draft' && (github.event.pull_request.draft == false || vars.FANTASTIC_PR_INCLUDE_DRAFTS == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Validate Fantastic PR Config
+        run: just validate-config
+
+      - name: Fetch base ref
+        run: git fetch origin "${{ github.base_ref }}" --depth=1
+
+      - name: Build and Run Fantastic PR PR Review
+        id: pr_review
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: just pr-review-ci base_ref="origin/${{ github.base_ref }}" is_fork="${{ github.event.pull_request.head.repo.fork }}"
+
+      - name: Upload PR Review SARIF
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && hashFiles('fantastic-pr-pr.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: fantastic-pr-pr.sarif
+          category: fantastic-pr-pr-review
+
+      - name: Upload PR Review Debug Artifacts
+        if: always() && steps.pr_review.outcome == 'failure' && hashFiles('fantastic-pr-debug/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: fantastic-pr-pr-review-debug
+          path: fantastic-pr-debug
+          retention-days: 2
+
+      - name: Fail If PR Review Failed
+        if: steps.pr_review.outcome == 'failure'
+        run: exit 1
+
+  security_scan:
+    name: Security Scan (Repo)
+    needs: tests
+    if: github.event_name != 'pull_request' || (github.event.action != 'closed' && github.event.action != 'converted_to_draft' && (github.event.pull_request.draft == false || vars.FANTASTIC_PR_INCLUDE_DRAFTS == 'true'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Validate Fantastic PR Config
+        run: just validate-config
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve Base Ref
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_BRANCH="${{ github.base_ref }}"
+          else
+            BASE_BRANCH="${{ github.event.repository.default_branch }}"
+            if [ -z "$BASE_BRANCH" ]; then
+              BASE_BRANCH="main"
+            fi
+          fi
+          git fetch origin "$BASE_BRANCH" --depth=1
+          echo "BASE_REF=origin/$BASE_BRANCH" >> "$GITHUB_ENV"
+
+      - name: Install Checkov and Gitleaks (Pinned)
+        env:
+          CHECKOV_VERSION: "3.2.469"
+          GITLEAKS_VERSION: "8.24.2"
+        run: |
+          just security-install-checkov version="${CHECKOV_VERSION}"
+          just security-install-gitleaks version="${GITLEAKS_VERSION}" out_dir="$RUNNER_TEMP/gitleaks-bin"
+          echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/gitleaks-bin/gitleaks" version
+
+      - name: Build and Run Fantastic PR Security Scan
+        id: security_scan
+        continue-on-error: true
+        run: just security-scan base_ref="$BASE_REF" fail_on=high
+
+      - name: Upload Security SARIF
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && hashFiles('fantastic-pr-security.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: fantastic-pr-security.sarif
+          category: fantastic-pr-security-scan
+
+      - name: Upload Security Debug Artifacts
+        if: always() && steps.security_scan.outcome == 'failure' && hashFiles('fantastic-pr-debug/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: fantastic-pr-security-debug
+          path: fantastic-pr-debug
+          retention-days: 2
+
+      - name: Fail If Security Scan Failed
+        if: steps.security_scan.outcome == 'failure'
+        run: exit 1

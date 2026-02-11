@@ -1,0 +1,8 @@
+Scan mode behavior:
+- Focus on local branch review coverage for developer workflows.
+- Include findings relevant for CLI output and automation gating.
+- Prefer deterministic and reproducible findings.
+- Keep findings structured and concise.
+- Group related observations and avoid duplicate reports for the same defect.
+- Prioritize security, correctness, and reliability over style-only concerns.
+- Keep findings anchored to explicit file/line evidence whenever possible.

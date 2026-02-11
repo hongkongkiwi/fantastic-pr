@@ -1,0 +1,4 @@
+# Add one glob per line to exclude files from Fantastic PR review.
+# Example:
+# docs/generated/**
+# frontend/build/**

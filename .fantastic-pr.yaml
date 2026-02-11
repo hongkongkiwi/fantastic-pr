@@ -1,0 +1,132 @@
+# yaml-language-server: $schema=./config/fantastic-pr.schema.json
+# Fantastic PR configuration
+profile: default
+inheritance: false
+extends: null
+
+max_reported_findings: 80
+max_examples_per_rule: 20
+max_inline_comments: 25
+large_pr_added_lines_threshold: 500
+missing_tests_added_lines_threshold: 120
+
+checks:
+  todo_comments: true
+  debug_statements: true
+  secret_patterns: true
+  large_pr: true
+  missing_tests: true
+  unsafe_rust: true
+  unwrap_usage: true
+  iac_misconfig: false
+
+pre_merge_checks:
+  todo_comments: inherit
+  debug_statements: inherit
+  secret_patterns: inherit
+  large_pr: inherit
+  missing_tests: inherit
+  unsafe_rust: inherit
+  unwrap_usage: inherit
+  iac_misconfig: inherit
+
+llm:
+  enabled: false
+  provider: openai-api
+  base_url: https://api.openai.com/v1
+  model: gpt-4.1-mini
+  api_key_env: OPENAI_API_KEY
+  cli_command: ""
+  cli_args: []
+  fallback_models: []
+  fallback_providers: []
+  agents:
+    - name: general
+      enabled: true
+      focus: Find concrete correctness, reliability, and regression risks in changed code.
+      prompt_file: prompts/agents/general.txt
+      provider: null
+      model: null
+      min_confidence: null
+    - name: security
+      enabled: true
+      focus: Focus on secrets, auth boundaries, injection, data exposure, and insecure defaults.
+      prompt_file: prompts/agents/security.txt
+      provider: null
+      model: null
+      min_confidence: 0.75
+    - name: maintainability
+      enabled: true
+      focus: Focus on testability, complexity risks, brittle abstractions, and long-term maintenance hazards.
+      prompt_file: prompts/agents/maintainability.txt
+      provider: null
+      model: null
+      min_confidence: null
+  prompt_core_file: prompts/core_system.txt
+  prompt_pr_file: prompts/mode_pr.txt
+  prompt_scan_file: prompts/mode_scan.txt
+  prompt_output_contract_file: prompts/output_contract.json
+  max_prompt_chars: 24000
+  max_findings: 20
+  max_chunks: 4
+  provider_timeout_secs: 90
+  min_confidence: 0.65
+  pr_changed_lines_only: true
+
+reviews:
+  auto_review:
+    enabled: true
+    include_drafts: false
+    labels: []
+    exclude_labels:
+      - skip-review
+    title_keywords: []
+    base_branches: []
+    ignore_usernames:
+      - dependabot[bot]
+  path_instructions:
+    - name: infrastructure
+      paths:
+        - .github/workflows/**
+        - '**/*.tf'
+        - '**/*.tfvars'
+      instructions: Focus on IAM least privilege, secret handling, and public exposure risks.
+
+tools:
+  sarif:
+    enabled: false
+    paths: []
+  eslint:
+    enabled: false
+    paths: []
+  semgrep:
+    enabled: false
+    paths: []
+  checkov:
+    enabled: false
+    paths: []
+  gitleaks:
+    enabled: false
+    paths: []
+  clippy:
+    enabled: false
+    paths: []
+
+filters:
+  include_globs: []
+  exclude_globs: []
+  ignore_file: .fantastic-prignore
+
+baseline:
+  enabled: false
+  file: .fantastic-pr-baseline.json
+  update: false
+
+scope:
+  initial_pr_scope: expanded
+  sync_scope: diff
+  manual_scope: expanded
+
+debug:
+  upload_failed_provider_artifacts: false
+  artifact_dir: fantastic-pr-debug

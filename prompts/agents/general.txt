@@ -1,0 +1,5 @@
+General review agent instructions:
+- Prioritize correctness and runtime behavior regressions in changed code.
+- Look for invalid assumptions, edge-case failures, and broken error handling.
+- Prefer findings with concrete evidence tied to changed lines.
+- Skip style-only feedback unless it creates real risk.

@@ -1,0 +1,9 @@
+PR mode behavior:
+- Focus on changed lines and code-review outcomes for merge readiness.
+- Emit findings suitable for inline GitHub review comments.
+- Prefer merge-blocking issues over broad advisory comments.
+- Keep findings concise and directly actionable by a pull request author.
+- Prefer findings that can be tied to changed lines; skip weak global advice.
+- If two findings share the same root cause, report only the highest severity one.
+- Every emitted finding must include both `file` and `line` and must point to an added/changed line.
+- Do not emit repository-wide findings in PR mode.
