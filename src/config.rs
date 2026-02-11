@@ -57,11 +57,9 @@ pub struct LlmConfig {
     pub model: String,
     pub api_key_env: String,
 
-    pub cli_command: String,
-    pub cli_args: Vec<String>,
-
     pub fallback_models: Vec<String>,
     pub fallback_providers: Vec<String>,
+    pub repo_skills: RepoSkillsConfig,
     pub agents: Vec<LlmAgentConfig>,
 
     pub prompt_core_file: String,
@@ -106,6 +104,48 @@ pub struct LlmAgentConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub min_confidence: Option<f64>,
+    pub mcp: Vec<LlmAgentMcpConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub struct RepoSkillsConfig {
+    pub enabled: bool,
+    pub max_files: usize,
+    pub max_chars_per_file: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub struct LlmAgentMcpConfig {
+    pub name: String,
+    pub enabled: bool,
+    pub transport: McpTransport,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub url: Option<String>,
+    pub auth_header_env: Option<String>,
+    pub tool_calls: Vec<McpToolCallConfig>,
+    pub timeout_secs: u64,
+    pub max_tool_result_chars: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub struct McpToolCallConfig {
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    Stdio,
+    Http,
+    Sse,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -262,11 +302,9 @@ impl Default for LlmConfig {
             model: "gpt-4.1-mini".to_string(),
             api_key_env: "OPENAI_API_KEY".to_string(),
 
-            cli_command: String::new(),
-            cli_args: Vec::new(),
-
             fallback_models: Vec::new(),
             fallback_providers: Vec::new(),
+            repo_skills: RepoSkillsConfig::default(),
             agents: vec![
                 LlmAgentConfig {
                     name: "general".to_string(),
@@ -277,6 +315,7 @@ impl Default for LlmConfig {
                     provider: None,
                     model: None,
                     min_confidence: None,
+                    mcp: Vec::new(),
                 },
                 LlmAgentConfig {
                     name: "security".to_string(),
@@ -288,6 +327,7 @@ impl Default for LlmConfig {
                     provider: None,
                     model: None,
                     min_confidence: Some(0.75),
+                    mcp: Vec::new(),
                 },
                 LlmAgentConfig {
                     name: "maintainability".to_string(),
@@ -299,6 +339,7 @@ impl Default for LlmConfig {
                     provider: None,
                     model: None,
                     min_confidence: None,
+                    mcp: Vec::new(),
                 },
             ],
 
@@ -340,7 +381,50 @@ impl Default for LlmAgentConfig {
             provider: None,
             model: None,
             min_confidence: None,
+            mcp: Vec::new(),
         }
+    }
+}
+
+impl Default for RepoSkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_files: 6,
+            max_chars_per_file: 1600,
+        }
+    }
+}
+
+impl Default for LlmAgentMcpConfig {
+    fn default() -> Self {
+        Self {
+            name: "context".to_string(),
+            enabled: true,
+            transport: McpTransport::Stdio,
+            command: None,
+            args: Vec::new(),
+            url: None,
+            auth_header_env: None,
+            tool_calls: Vec::new(),
+            timeout_secs: 20,
+            max_tool_result_chars: 4000,
+        }
+    }
+}
+
+impl Default for McpToolCallConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            arguments: Value::Object(Default::default()),
+        }
+    }
+}
+
+impl Default for McpTransport {
+    fn default() -> Self {
+        Self::Stdio
     }
 }
 
@@ -565,6 +649,21 @@ impl AppConfig {
         if self.llm.provider_timeout_secs < 1 {
             bail!("llm.provider_timeout_secs must be >= 1");
         }
+        if self.llm.repo_skills.max_files < 1 {
+            bail!("llm.repo_skills.max_files must be >= 1");
+        }
+        if self.llm.repo_skills.max_chars_per_file < 128 {
+            bail!("llm.repo_skills.max_chars_per_file must be >= 128");
+        }
+        if self.llm.provider.trim().is_empty() {
+            bail!("llm.provider must be non-empty");
+        }
+        if !is_supported_llm_provider(&self.llm.provider) {
+            bail!(
+                "llm.provider '{}' is not supported; expected one of: openai-api, openai-compatible, anthropic-api, gemini-api",
+                self.llm.provider
+            );
+        }
         if !(0.0..=1.0).contains(&self.llm.min_confidence) {
             bail!("llm.min_confidence must be between 0.0 and 1.0");
         }
@@ -588,6 +687,25 @@ impl AppConfig {
         {
             bail!("llm.judge_model must be non-empty when set");
         }
+        for (idx, fallback) in self.llm.fallback_providers.iter().enumerate() {
+            let (provider, model) = if let Some((p, m)) = fallback.split_once(':') {
+                (p.trim(), Some(m.trim()))
+            } else {
+                (fallback.trim(), None)
+            };
+            if provider.is_empty() {
+                bail!("llm.fallback_providers[{idx}] provider cannot be empty");
+            }
+            if !is_supported_llm_provider(provider) {
+                bail!(
+                    "llm.fallback_providers[{idx}] provider '{}' is not supported; expected one of: openai-api, openai-compatible, anthropic-api, gemini-api",
+                    provider
+                );
+            }
+            if matches!(model, Some(m) if m.is_empty()) {
+                bail!("llm.fallback_providers[{idx}] model hint cannot be empty");
+            }
+        }
         let mut seen_agent_names = std::collections::BTreeSet::new();
         for (idx, agent) in self.llm.agents.iter().enumerate() {
             if agent.name.trim().is_empty() {
@@ -610,10 +728,75 @@ impl AppConfig {
             {
                 bail!("llm.agents[{idx}].provider must be non-empty when set");
             }
+            if let Some(provider) = &agent.provider
+                && !is_supported_llm_provider(provider)
+            {
+                bail!(
+                    "llm.agents[{idx}].provider '{}' is not supported; expected one of: openai-api, openai-compatible, anthropic-api, gemini-api",
+                    provider
+                );
+            }
             if let Some(model) = &agent.model
                 && model.trim().is_empty()
             {
                 bail!("llm.agents[{idx}].model must be non-empty when set");
+            }
+            for (mcp_idx, mcp) in agent.mcp.iter().enumerate() {
+                if mcp.name.trim().is_empty() {
+                    bail!("llm.agents[{idx}].mcp[{mcp_idx}].name must be non-empty");
+                }
+                if !mcp.enabled {
+                    continue;
+                }
+                if mcp.timeout_secs < 1 {
+                    bail!("llm.agents[{idx}].mcp[{mcp_idx}].timeout_secs must be >= 1");
+                }
+                if mcp.max_tool_result_chars < 64 {
+                    bail!("llm.agents[{idx}].mcp[{mcp_idx}].max_tool_result_chars must be >= 64");
+                }
+                match mcp.transport {
+                    McpTransport::Stdio => {
+                        let command = mcp.command.as_deref().unwrap_or("").trim();
+                        if command.is_empty() {
+                            bail!(
+                                "llm.agents[{idx}].mcp[{mcp_idx}].command must be set for stdio transport"
+                            );
+                        }
+                    }
+                    McpTransport::Http | McpTransport::Sse => {
+                        let url = mcp.url.as_deref().unwrap_or("").trim();
+                        if url.is_empty() {
+                            bail!(
+                                "llm.agents[{idx}].mcp[{mcp_idx}].url must be set for {} transport",
+                                mcp_transport_name(mcp.transport)
+                            );
+                        }
+                        if !url.starts_with("http://") && !url.starts_with("https://") {
+                            bail!(
+                                "llm.agents[{idx}].mcp[{mcp_idx}].url must start with http:// or https://"
+                            );
+                        }
+                    }
+                }
+                if let Some(auth_header_env) = &mcp.auth_header_env
+                    && auth_header_env.trim().is_empty()
+                {
+                    bail!(
+                        "llm.agents[{idx}].mcp[{mcp_idx}].auth_header_env must be non-empty when set"
+                    );
+                }
+                for (tool_idx, tool) in mcp.tool_calls.iter().enumerate() {
+                    if tool.name.trim().is_empty() {
+                        bail!(
+                            "llm.agents[{idx}].mcp[{mcp_idx}].tool_calls[{tool_idx}].name must be non-empty"
+                        );
+                    }
+                    if !tool.arguments.is_object() && !tool.arguments.is_null() {
+                        bail!(
+                            "llm.agents[{idx}].mcp[{mcp_idx}].tool_calls[{tool_idx}].arguments must be an object"
+                        );
+                    }
+                }
             }
         }
         for (idx, entry) in self.reviews.path_instructions.iter().enumerate() {
@@ -647,6 +830,21 @@ impl AppConfig {
             }
         }
         Ok(())
+    }
+}
+
+fn is_supported_llm_provider(provider: &str) -> bool {
+    matches!(
+        provider.trim(),
+        "openai-api" | "openai-compatible" | "anthropic-api" | "gemini-api"
+    )
+}
+
+fn mcp_transport_name(transport: McpTransport) -> &'static str {
+    match transport {
+        McpTransport::Stdio => "stdio",
+        McpTransport::Http => "http",
+        McpTransport::Sse => "sse",
     }
 }
 
@@ -1001,10 +1199,13 @@ fn apply_override(cfg: &mut AppConfig, key: &str, value: &str) -> anyhow::Result
         "llm.base_url" => cfg.llm.base_url = value.to_string(),
         "llm.model" => cfg.llm.model = value.to_string(),
         "llm.api_key_env" => cfg.llm.api_key_env = value.to_string(),
-        "llm.cli_command" => cfg.llm.cli_command = value.to_string(),
-        "llm.cli_args" => cfg.llm.cli_args = parse_csv(value),
         "llm.fallback_models" => cfg.llm.fallback_models = parse_csv(value),
         "llm.fallback_providers" => cfg.llm.fallback_providers = parse_csv(value),
+        "llm.repo_skills.enabled" => cfg.llm.repo_skills.enabled = parse_bool(key, value)?,
+        "llm.repo_skills.max_files" => cfg.llm.repo_skills.max_files = parse_usize(key, value)?,
+        "llm.repo_skills.max_chars_per_file" => {
+            cfg.llm.repo_skills.max_chars_per_file = parse_usize(key, value)?
+        }
         "llm.prompt_core_file" => cfg.llm.prompt_core_file = value.to_string(),
         "llm.prompt_pr_file" => cfg.llm.prompt_pr_file = value.to_string(),
         "llm.prompt_scan_file" => cfg.llm.prompt_scan_file = value.to_string(),
@@ -1152,10 +1353,16 @@ mod tests {
         apply_override(&mut cfg, "pre_merge_checks.unwrap_usage", "error")
             .expect("mode override should work");
         apply_override(&mut cfg, "baseline.enabled", "true").expect("baseline bool");
-        apply_override(&mut cfg, "llm.provider", "gemini-cli").expect("provider set");
+        apply_override(&mut cfg, "llm.provider", "gemini-api").expect("provider set");
         apply_override(&mut cfg, "scope.sync_scope", "expanded").expect("scope set");
         apply_override(&mut cfg, "llm.fallback_models", "gpt-4.1-mini,gpt-4o-mini")
             .expect("fallback models set");
+        apply_override(&mut cfg, "llm.repo_skills.enabled", "true")
+            .expect("repo skills toggle should work");
+        apply_override(&mut cfg, "llm.repo_skills.max_files", "4")
+            .expect("repo skills max files should work");
+        apply_override(&mut cfg, "llm.repo_skills.max_chars_per_file", "2048")
+            .expect("repo skills max chars should work");
 
         cfg.normalize();
         assert_eq!(cfg.profile, "iac");
@@ -1181,9 +1388,12 @@ mod tests {
             "prompts/workflows/revise-alt.txt"
         );
         assert!(cfg.baseline.enabled);
-        assert_eq!(cfg.llm.provider, "gemini-cli");
+        assert_eq!(cfg.llm.provider, "gemini-api");
         assert_eq!(cfg.scope.sync_scope, "expanded");
         assert_eq!(cfg.llm.fallback_models.len(), 2);
+        assert!(cfg.llm.repo_skills.enabled);
+        assert_eq!(cfg.llm.repo_skills.max_files, 4);
+        assert_eq!(cfg.llm.repo_skills.max_chars_per_file, 2048);
     }
 
     #[test]
@@ -1292,6 +1502,7 @@ llm:
             provider: None,
             model: None,
             min_confidence: Some(1.1),
+            mcp: Vec::new(),
         }];
         let path = unique_temp_file("agent-conf", "yaml");
         cfg.write_yaml(&path).expect("write yaml");
@@ -1631,6 +1842,52 @@ llm:
         let err = AppConfig::load_from_file(&path).expect_err("invalid model should fail");
         let _ = std::fs::remove_file(&path);
         assert!(err.to_string().contains("model must be non-empty"));
+    }
+
+    #[test]
+    fn validates_agent_mcp_config_shapes() {
+        let path = unique_temp_file("invalid-agent-mcp-stdio", "yaml");
+        std::fs::write(
+            &path,
+            r#"
+llm:
+  agents:
+    - name: security
+      enabled: true
+      focus: x
+      mcp:
+        - name: mcp-tools
+          transport: stdio
+          command: "   "
+"#,
+        )
+        .expect("write yaml");
+        let err = AppConfig::load_from_file(&path).expect_err("invalid stdio command should fail");
+        let _ = std::fs::remove_file(&path);
+        assert!(err.to_string().contains("command must be set"));
+
+        let path = unique_temp_file("invalid-agent-mcp-args", "yaml");
+        std::fs::write(
+            &path,
+            r#"
+llm:
+  agents:
+    - name: security
+      enabled: true
+      focus: x
+      mcp:
+        - name: mcp-http
+          transport: http
+          url: https://example.com/mcp
+          tool_calls:
+            - name: ping
+              arguments: [1, 2, 3]
+"#,
+        )
+        .expect("write yaml");
+        let err = AppConfig::load_from_file(&path).expect_err("invalid tool args should fail");
+        let _ = std::fs::remove_file(&path);
+        assert!(err.to_string().contains("arguments must be an object"));
     }
 
     #[test]

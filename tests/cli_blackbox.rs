@@ -206,11 +206,10 @@ fn scan_llm_uses_embedded_prompt_defaults_without_repo_prompt_pack() {
         r#"
 llm:
   enabled: true
-  provider: codex-cli
-  cli_command: sh
-  cli_args:
-    - -lc
-    - "cat >/dev/null; printf '{\"findings\": []}'"
+  provider: openai-api
+  base_url: http://127.0.0.1:9
+  api_key_env: PATH
+  provider_timeout_secs: 1
 "#,
     );
 
@@ -227,8 +226,8 @@ llm:
     let text = output_text(&output);
     assert!(output.status.success(), "{text}");
     assert!(
-        !text.contains("LLM pass skipped"),
-        "expected embedded prompt defaults to avoid LLM skip\n{text}"
+        !text.contains("failed to read prompt file"),
+        "expected embedded prompt defaults without repo-local prompt files\n{text}"
     );
     assert!(text.contains("Fantastic PR Report"), "{text}");
 

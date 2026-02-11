@@ -741,6 +741,7 @@ mod tests {
     use crate::filtering::FileFilter;
     use crate::github::PrContext;
     use clap::Parser;
+    use mockito::{Matcher, Server};
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::path::Path;
@@ -1400,7 +1401,14 @@ mod tests {
     }
 
     #[test]
-    fn gather_findings_respects_enable_llm_cli_flag_when_config_disables_llm() {
+    fn gather_findings_respects_enable_llm_flag_when_config_disables_llm() {
+        let _lock = crate::test_global_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _no_proxy = EnvGuard::set("NO_PROXY", "*");
+        let _http_proxy = EnvGuard::set("HTTP_PROXY", "");
+        let _https_proxy = EnvGuard::set("HTTPS_PROXY", "");
+        let mut server = Server::new();
         let diff_text = r#"diff --git a/src/lib.rs b/src/lib.rs
 --- a/src/lib.rs
 +++ b/src/lib.rs
@@ -1410,14 +1418,21 @@ mod tests {
         let diff = parse_unified_diff(diff_text).expect("parse diff");
         let mut cfg = AppConfig::default();
         cfg.llm.enabled = false;
-        cfg.llm.provider = "codex-cli".to_string();
-        cfg.llm.cli_command = "sh".to_string();
-        cfg.llm.cli_args = vec![
-            "-c".to_string(),
-            "printf '%s' '{\"findings\":[{\"rule\":\"cli-llm\",\"severity\":\"warning\",\"title\":\"llm title\",\"details\":\"llm details\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"line\"]}]}'".to_string(),
-        ];
+        cfg.llm.provider = "openai-api".to_string();
+        cfg.llm.base_url = server.url();
+        cfg.llm.api_key_env = "PATH".to_string();
+        cfg.llm.provider_timeout_secs = 2;
         cfg.llm.agents.clear();
         set_absolute_prompt_pack(&mut cfg);
+        let _mock = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex("File: src/lib.rs".to_string()))
+            .expect(1)
+            .with_status(200)
+            .with_body(
+                r#"{"choices":[{"message":{"content":"{\"findings\":[{\"rule\":\"api-llm\",\"severity\":\"warning\",\"title\":\"llm title\",\"details\":\"llm details\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"line\"]}]}"}}]}"#,
+            )
+            .create();
 
         let filter = FileFilter::from_config(&cfg.filters).expect("filter");
         let cli = test_cli();
@@ -1435,7 +1450,7 @@ mod tests {
         )
         .expect("gather findings");
 
-        assert!(findings.iter().any(|f| f.rule == "llm:cli-llm"));
+        assert!(findings.iter().any(|f| f.rule == "llm:api-llm"));
     }
 
     #[test]

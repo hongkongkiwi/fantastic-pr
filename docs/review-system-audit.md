@@ -7,7 +7,7 @@ Build a high-signal PR reviewer for GitHub + local CLI workflows with determinis
 ## Key decisions
 
 - Use internal API SDK providers as the primary path (`openai-api`, `anthropic-api`, `gemini-api`, `openai-compatible`).
-- Keep CLI backends (`codex-cli`, `claude-code`, `kimi-cli`, `qwen-cli`, `gemini-cli`, `opencode-cli`) as optional adapters/fallbacks.
+- Use API SDK providers as the only supported provider path.
 - Enforce strict JSON output contract and reject malformed responses.
 - Gate PR-mode LLM findings to changed lines only.
 - Filter low-confidence findings by threshold.

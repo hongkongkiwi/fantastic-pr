@@ -22,7 +22,7 @@ Goal: keep sessions fast, consistent, and safe while minimizing prompt/context b
 - `src/config.rs`: config schema, YAML/TOML loading, inheritance merge, overrides.
 - `src/diff.rs`: diff parsing + changed-line extraction.
 - `src/checks.rs`: deterministic rules, severity model, markdown/json formatting.
-- `src/llm.rs`: provider adapters (API + CLI), prompt chunking, schema validation, gating.
+- `src/llm.rs`: API provider adapters, prompt chunking, schema validation, gating.
 - `src/github.rs`: PR context parsing, upsert report, inline idempotency.
 - `src/ingest.rs`: external tool ingest (SARIF/ESLint/Semgrep/Checkov/Gitleaks/Clippy).
 - `src/sarif.rs`: findings -> SARIF conversion.
@@ -48,9 +48,10 @@ Goal: keep sessions fast, consistent, and safe while minimizing prompt/context b
 - `reviews.path_instructions` injects path-specific guidance into LLM system prompt when matching changed files exist.
 
 ## LLM Policy Model
-- SDK/API providers are preferred (`openai-api`, `anthropic-api`, `gemini-api`, `openai-compatible`).
-- CLI providers are fallback adapters (`codex-cli`, `claude-code`, `kimi-cli`, `qwen-cli`, `gemini-cli`, `opencode-cli`).
+- SDK/API providers: `openai-api`, `anthropic-api`, `gemini-api`, `openai-compatible`.
 - Multi-agent execution is configured via `llm.agents` (role-specialized passes merged/deduped before publish).
+- Optional repository skill-context ingestion via `llm.repo_skills` (default off).
+- Optional per-agent MCP context sources via `llm.agents[].mcp` (`stdio`, `http`, `sse`).
 - Guardrails:
   - strict JSON envelope validation
   - confidence gate (`llm.min_confidence`)
@@ -73,7 +74,7 @@ Goal: keep sessions fast, consistent, and safe while minimizing prompt/context b
 - PR mode example: `cargo run -- pr --base-ref origin/main`
 
 ## GitHub Workflow Notes
-- Workflow file: `.github/workflows/fantastic-pr.yml`
+- Example workflow template: `examples/workflows/fantastic-pr.yml`
 - Two jobs:
   - `PR Review (Diff)`
   - `Security Scan (Repo)`

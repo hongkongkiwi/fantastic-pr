@@ -1,10 +1,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Write};
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use globset::{Glob, GlobSetBuilder};
@@ -14,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::checks::{Finding, Severity};
-use crate::config::{DebugConfig, LlmAgentConfig, LlmConfig, LlmWorkflowStrategy, ReviewConfig};
+use crate::config::{
+    DebugConfig, LlmAgentConfig, LlmAgentMcpConfig, LlmConfig, LlmWorkflowStrategy,
+    McpToolCallConfig, McpTransport, ReviewConfig,
+};
 use crate::diff::DiffData;
 
 #[derive(Debug, Clone, Copy)]
@@ -539,6 +540,14 @@ pub fn probe_provider(config: &LlmConfig) -> anyhow::Result<()> {
 }
 
 fn resolve_agent_runtimes(config: &LlmConfig) -> anyhow::Result<Vec<AgentRuntime>> {
+    let repo_skill_context = match build_repo_skill_context(config) {
+        Ok(content) => content,
+        Err(err) => {
+            eprintln!("Repository skill context skipped: {err:#}");
+            String::new()
+        }
+    };
+
     let enabled_agents = config
         .agents
         .iter()
@@ -550,7 +559,7 @@ fn resolve_agent_runtimes(config: &LlmConfig) -> anyhow::Result<Vec<AgentRuntime
         return Ok(vec![AgentRuntime {
             name: "default".to_string(),
             config: config.clone(),
-            instructions: String::new(),
+            instructions: repo_skill_context,
         }]);
     }
 
@@ -581,14 +590,17 @@ fn resolve_agent_runtimes(config: &LlmConfig) -> anyhow::Result<Vec<AgentRuntime
         out.push(AgentRuntime {
             name: agent.name.trim().to_string(),
             config: agent_cfg,
-            instructions: build_agent_instruction_context(&agent)?,
+            instructions: build_agent_instruction_context(&agent, &repo_skill_context)?,
         });
     }
 
     Ok(out)
 }
 
-fn build_agent_instruction_context(agent: &LlmAgentConfig) -> anyhow::Result<String> {
+fn build_agent_instruction_context(
+    agent: &LlmAgentConfig,
+    repo_skill_context: &str,
+) -> anyhow::Result<String> {
     let mut parts = Vec::new();
     if !agent.focus.trim().is_empty() {
         parts.push(format!(
@@ -613,8 +625,291 @@ fn build_agent_instruction_context(agent: &LlmAgentConfig) -> anyhow::Result<Str
             parts.push(content);
         }
     }
+    if !repo_skill_context.trim().is_empty() {
+        parts.push(repo_skill_context.to_string());
+    }
+
+    let mcp_context = build_agent_mcp_context(agent);
+    if !mcp_context.trim().is_empty() {
+        parts.push(mcp_context);
+    }
 
     Ok(parts.join("\n\n"))
+}
+
+fn build_repo_skill_context(config: &LlmConfig) -> anyhow::Result<String> {
+    if !config.repo_skills.enabled {
+        return Ok(String::new());
+    }
+
+    let root = Path::new("skills");
+    if !root.exists() {
+        return Ok(String::new());
+    }
+
+    let mut files = Vec::new();
+    collect_skill_files(root, &mut files)?;
+    files.sort();
+    files.truncate(config.repo_skills.max_files);
+
+    let mut sections = Vec::new();
+    for file in files {
+        let content = fs::read_to_string(&file)
+            .with_context(|| format!("failed to read repository skill file {}", file.display()))?;
+        if content.trim().is_empty() {
+            continue;
+        }
+        sections.push(format!(
+            "Skill file `{}`:\n{}",
+            file.display(),
+            truncate_text(&content, config.repo_skills.max_chars_per_file)
+        ));
+    }
+
+    if sections.is_empty() {
+        return Ok(String::new());
+    }
+
+    Ok(format!(
+        "Repository skill context (local SKILL.md files):\n{}",
+        sections.join("\n\n")
+    ))
+}
+
+fn collect_skill_files(root: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("failed to read skills directory {}", root.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read skills entry in {}", root.display()))?;
+        let file_type = entry.file_type().with_context(|| {
+            format!("failed to inspect skills entry {}", entry.path().display())
+        })?;
+        if file_type.is_dir() {
+            collect_skill_files(&entry.path(), out)?;
+            continue;
+        }
+        if file_type.is_file() && entry.file_name() == "SKILL.md" {
+            out.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn build_agent_mcp_context(agent: &LlmAgentConfig) -> String {
+    let mut sections = Vec::new();
+    for mcp in agent.mcp.iter().filter(|cfg| cfg.enabled) {
+        match collect_mcp_context_sync(agent, mcp) {
+            Ok(content) => {
+                if !content.trim().is_empty() {
+                    sections.push(format!(
+                        "MCP context from '{}' (transport={}):\n{}",
+                        mcp.name,
+                        mcp_transport_label(mcp.transport),
+                        content
+                    ));
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "LLM agent '{}' MCP context '{}' skipped: {err:#}",
+                    agent.name, mcp.name
+                );
+            }
+        }
+    }
+    sections.join("\n\n")
+}
+
+fn collect_mcp_context_sync(
+    agent: &LlmAgentConfig,
+    mcp: &LlmAgentMcpConfig,
+) -> anyhow::Result<String> {
+    let agent_name = agent.name.clone();
+    let mcp_cfg = mcp.clone();
+    run_on_tokio_thread(async move { collect_mcp_context_async(&agent_name, &mcp_cfg).await })
+}
+
+fn run_on_tokio_thread<F, T>(future: F) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let handle = std::thread::spawn(move || -> anyhow::Result<T> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to initialize Tokio runtime for MCP context")?;
+        runtime.block_on(future)
+    });
+
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => bail!("MCP runtime thread panicked"),
+    }
+}
+
+async fn collect_mcp_context_async(
+    agent_name: &str,
+    mcp: &LlmAgentMcpConfig,
+) -> anyhow::Result<String> {
+    use rmcp::{
+        ServiceExt,
+        transport::{
+            StreamableHttpClientTransport, TokioChildProcess,
+            streamable_http_client::StreamableHttpClientTransportConfig,
+        },
+    };
+
+    match mcp.transport {
+        McpTransport::Stdio => {
+            let command = mcp
+                .command
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .context("missing MCP stdio command")?;
+            let mut child_command = tokio::process::Command::new(command);
+            child_command.args(&mcp.args);
+            let transport = TokioChildProcess::new(child_command).with_context(|| {
+                format!(
+                    "failed to spawn MCP stdio process '{}' for agent '{}'",
+                    command, agent_name
+                )
+            })?;
+            let service = ().serve(transport).await.with_context(|| {
+                format!("failed to initialize MCP stdio transport for agent '{agent_name}'")
+            })?;
+            let output = execute_mcp_tool_calls(service.peer(), mcp).await;
+            let _ = service.cancel().await;
+            output
+        }
+        McpTransport::Http | McpTransport::Sse => {
+            let url = mcp
+                .url
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .context("missing MCP URL")?;
+            let mut transport_cfg = StreamableHttpClientTransportConfig::with_uri(url.to_string());
+            if let Some(auth_header_env) = mcp
+                .auth_header_env
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                && let Ok(auth_header) = std::env::var(auth_header_env)
+                && !auth_header.trim().is_empty()
+            {
+                transport_cfg = transport_cfg.auth_header(auth_header);
+            }
+
+            let transport = StreamableHttpClientTransport::from_config(transport_cfg);
+            let service = ().serve(transport).await.with_context(|| {
+                format!(
+                    "failed to initialize MCP {} transport '{}' for agent '{}'",
+                    mcp_transport_label(mcp.transport),
+                    url,
+                    agent_name
+                )
+            })?;
+            let output = execute_mcp_tool_calls(service.peer(), mcp).await;
+            let _ = service.cancel().await;
+            output
+        }
+    }
+}
+
+async fn execute_mcp_tool_calls(
+    peer: &rmcp::service::Peer<rmcp::RoleClient>,
+    mcp: &LlmAgentMcpConfig,
+) -> anyhow::Result<String> {
+    let timeout = Duration::from_secs(mcp.timeout_secs.max(1));
+
+    if mcp.tool_calls.is_empty() {
+        let tools = tokio::time::timeout(timeout, peer.list_all_tools())
+            .await
+            .with_context(|| format!("MCP list_tools timed out after {}s", timeout.as_secs()))?
+            .context("MCP list_tools failed")?;
+        if tools.is_empty() {
+            return Ok("No tools reported by MCP server.".to_string());
+        }
+        let mut names = tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>();
+        names.sort();
+        return Ok(format!(
+            "Available MCP tools: {}",
+            names.into_iter().take(20).collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    let mut sections = Vec::new();
+    for call in &mcp.tool_calls {
+        let params = mcp_call_params(call)?;
+        let result = tokio::time::timeout(timeout, peer.call_tool(params))
+            .await
+            .with_context(|| {
+                format!(
+                    "MCP call_tool '{}' timed out after {}s",
+                    call.name,
+                    timeout.as_secs()
+                )
+            })?
+            .with_context(|| format!("MCP call_tool '{}' failed", call.name))?;
+        sections.push(format!(
+            "Tool `{}` result:\n{}",
+            call.name,
+            render_mcp_tool_result(&result, mcp.max_tool_result_chars)
+        ));
+    }
+
+    Ok(sections.join("\n\n"))
+}
+
+fn mcp_call_params(call: &McpToolCallConfig) -> anyhow::Result<rmcp::model::CallToolRequestParams> {
+    let arguments = match &call.arguments {
+        Value::Object(map) => Some(map.clone()),
+        Value::Null => None,
+        _ => bail!("MCP tool call arguments must be an object"),
+    };
+
+    Ok(rmcp::model::CallToolRequestParams {
+        meta: None,
+        name: call.name.clone().into(),
+        arguments,
+        task: None,
+    })
+}
+
+fn render_mcp_tool_result(result: &rmcp::model::CallToolResult, max_chars: usize) -> String {
+    let mut parts = Vec::new();
+    for item in &result.content {
+        match &item.raw {
+            rmcp::model::RawContent::Text(text) => parts.push(text.text.clone()),
+            other => {
+                let rendered = serde_json::to_string(other)
+                    .unwrap_or_else(|_| "[non-text MCP content]".to_string());
+                parts.push(rendered);
+            }
+        }
+    }
+    if let Some(structured) = &result.structured_content {
+        parts.push(structured.to_string());
+    }
+    let mut out = parts.join("\n");
+    if out.trim().is_empty() {
+        out = "[empty MCP tool result]".to_string();
+    }
+    if matches!(result.is_error, Some(true)) {
+        out = format!("(tool reported error)\n{out}");
+    }
+    truncate_text(&out, max_chars)
+}
+
+fn mcp_transport_label(transport: McpTransport) -> &'static str {
+    match transport {
+        McpTransport::Stdio => "stdio",
+        McpTransport::Http => "http",
+        McpTransport::Sse => "sse",
+    }
 }
 
 fn merge_agent_candidate(
@@ -1371,19 +1666,8 @@ fn run_provider_attempt(
             AnthropicApiClient::new(config, attempt.provider.as_str())?.complete(&request)
         }
         "gemini-api" => GeminiApiClient::new(config, attempt.provider.as_str())?.complete(&request),
-        "codex-cli" | "claude-code" | "kimi-cli" | "qwen-cli" | "gemini-cli" | "opencode-cli" => {
-            run_cli_provider(
-                config,
-                prompts,
-                mode,
-                chunk,
-                attempt,
-                path_instruction_context,
-                agent_instruction_context,
-            )
-        }
         other => bail!(
-            "unsupported llm.provider '{}'; expected openai-api, anthropic-api, gemini-api, or supported CLI backends",
+            "unsupported llm.provider '{}'; expected openai-api, anthropic-api, gemini-api, or openai-compatible",
             other
         ),
     }
@@ -1454,176 +1738,6 @@ fn http_client(timeout_secs: u64, base_url: Option<&str>) -> anyhow::Result<Clie
     builder
         .build()
         .context("failed to build provider HTTP client")
-}
-
-fn run_cli_provider(
-    config: &LlmConfig,
-    prompts: &PromptPack,
-    mode: ReviewMode,
-    chunk: &str,
-    attempt: &ProviderAttempt,
-    path_instruction_context: &str,
-    agent_instruction_context: &str,
-) -> anyhow::Result<String> {
-    let allow_custom = attempt.provider == config.provider;
-    let (cmd, args) = resolve_cli_command(config, &attempt.provider, allow_custom)?;
-    let model_hint = attempt
-        .model
-        .clone()
-        .unwrap_or_else(|| config.model.clone());
-    let payload = format!(
-        "Preferred model hint: {}\n\n{}\n\n{}\n\n{}",
-        model_hint,
-        build_system_prompt(
-            prompts,
-            mode,
-            path_instruction_context,
-            agent_instruction_context,
-        ),
-        prompts.output_contract,
-        chunk
-    );
-    let (resolved_args, pass_stdin) = resolve_arg_templates(&args, &payload, &model_hint);
-
-    let mut child = Command::new(&cmd)
-        .args(&resolved_args)
-        .stdin(if pass_stdin {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn {} with args {:?}", cmd, resolved_args))?;
-
-    let mut stdout_pipe = child
-        .stdout
-        .take()
-        .context("failed to access provider stdout")?;
-    let mut stderr_pipe = child
-        .stderr
-        .take()
-        .context("failed to access provider stderr")?;
-    let stdout_reader = thread::spawn(move || -> std::io::Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        stdout_pipe.read_to_end(&mut buf)?;
-        Ok(buf)
-    });
-    let stderr_reader = thread::spawn(move || -> std::io::Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        stderr_pipe.read_to_end(&mut buf)?;
-        Ok(buf)
-    });
-
-    if pass_stdin {
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("failed to access provider stdin")?;
-        stdin
-            .write_all(payload.as_bytes())
-            .context("failed writing prompt to provider stdin")?;
-        drop(stdin);
-    }
-
-    let timeout = Duration::from_secs(config.provider_timeout_secs.max(1));
-    let started = Instant::now();
-    let mut timed_out = false;
-    loop {
-        if child
-            .try_wait()
-            .context("failed polling provider process status")?
-            .is_some()
-        {
-            break;
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            timed_out = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    let status = child
-        .wait()
-        .context("failed waiting for provider process")?;
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("provider stdout reader thread panicked"))?
-        .context("failed reading provider stdout")?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("provider stderr reader thread panicked"))?
-        .context("failed reading provider stderr")?;
-    let stdout = String::from_utf8_lossy(&stdout).to_string();
-    let stderr = String::from_utf8_lossy(&stderr).to_string();
-
-    if timed_out {
-        bail!(
-            "provider command '{}' timed out after {}s: {}",
-            cmd,
-            timeout.as_secs(),
-            stderr.trim()
-        );
-    }
-
-    if !status.success() {
-        bail!("provider command '{}' failed: {}", cmd, stderr.trim());
-    }
-
-    if stdout.trim().is_empty() {
-        bail!("provider command '{}' returned empty output", cmd);
-    }
-
-    Ok(stdout)
-}
-
-fn resolve_cli_command(
-    config: &LlmConfig,
-    provider: &str,
-    allow_custom: bool,
-) -> anyhow::Result<(String, Vec<String>)> {
-    if allow_custom && !config.cli_command.is_empty() {
-        return Ok((config.cli_command.clone(), config.cli_args.clone()));
-    }
-
-    let (cmd, args): (&str, &[&str]) = match provider {
-        "codex-cli" => ("codex", &["exec", "--json", "-"]),
-        "claude-code" => ("claude", &["-p", "{prompt}"]),
-        "kimi-cli" => ("kimi", &["chat", "--json"]),
-        "qwen-cli" => ("qwen", &["chat", "--json"]),
-        "gemini-cli" => ("gemini", &["-p", "{prompt}"]),
-        "opencode-cli" => ("opencode", &["run", "--json"]),
-        _ => {
-            bail!(
-                "no default command for provider '{}'; set llm.cli_command",
-                provider
-            )
-        }
-    };
-
-    Ok((
-        cmd.to_string(),
-        args.iter().map(|v| (*v).to_string()).collect(),
-    ))
-}
-
-fn resolve_arg_templates(args: &[String], payload: &str, model_hint: &str) -> (Vec<String>, bool) {
-    let mut out = Vec::with_capacity(args.len());
-    let mut pass_stdin = true;
-    for arg in args {
-        match arg.as_str() {
-            "{prompt}" => {
-                out.push(payload.to_string());
-                pass_stdin = false;
-            }
-            "{model}" => out.push(model_hint.to_string()),
-            _ => out.push(arg.to_string()),
-        }
-    }
-    (out, pass_stdin)
 }
 
 fn build_system_prompt(
@@ -2139,9 +2253,8 @@ mod tests {
         filter_by_consensus_support, llm_candidate_key, merge_agent_candidate,
         normalize_path_for_compare, parse_envelope, probe_provider, provider_api_key,
         provider_attempts, provider_base_url, read_prompt_file, render_merged_candidates,
-        resolve_agent_runtimes, resolve_arg_templates, resolve_cli_command, run_cli_provider,
-        run_llm_review, run_provider_attempt, should_keep_llm_finding, validate_envelope_schema,
-        write_failed_attempt_artifacts,
+        resolve_agent_runtimes, run_llm_review, run_provider_attempt, should_keep_llm_finding,
+        validate_envelope_schema, write_failed_attempt_artifacts,
     };
     use crate::config::{
         DebugConfig, LlmAgentConfig, LlmConfig, LlmWorkflowStrategy, PathInstruction, ReviewConfig,
@@ -2392,7 +2505,10 @@ diff --git a/src/b.rs b/src/b.rs
     fn provider_attempts_include_fallbacks() {
         let cfg = LlmConfig {
             fallback_models: vec!["m1".to_string(), "m2".to_string()],
-            fallback_providers: vec!["qwen-cli".to_string(), "gemini-cli:g2".to_string()],
+            fallback_providers: vec![
+                "anthropic-api".to_string(),
+                "gemini-api:gemini-2.5-pro".to_string(),
+            ],
             ..LlmConfig::default()
         };
 
@@ -2401,9 +2517,9 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(attempts[0].provider, "openai-api");
         assert_eq!(attempts[1].model.as_deref(), Some("m1"));
         assert_eq!(attempts[2].model.as_deref(), Some("m2"));
-        assert_eq!(attempts[3].provider, "qwen-cli");
-        assert_eq!(attempts[4].provider, "gemini-cli");
-        assert_eq!(attempts[4].model.as_deref(), Some("g2"));
+        assert_eq!(attempts[3].provider, "anthropic-api");
+        assert_eq!(attempts[4].provider, "gemini-api");
+        assert_eq!(attempts[4].model.as_deref(), Some("gemini-2.5-pro"));
     }
 
     #[test]
@@ -2433,6 +2549,7 @@ diff --git a/src/b.rs b/src/b.rs
                     provider: None,
                     model: None,
                     min_confidence: None,
+                    mcp: Vec::new(),
                 },
                 LlmAgentConfig {
                     name: "off".to_string(),
@@ -2442,6 +2559,7 @@ diff --git a/src/b.rs b/src/b.rs
                     provider: None,
                     model: None,
                     min_confidence: None,
+                    mcp: Vec::new(),
                 },
             ],
             ..LlmConfig::default()
@@ -2567,19 +2685,6 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
-    fn resolves_prompt_arg_template() {
-        let args = vec![
-            "-p".to_string(),
-            "{prompt}".to_string(),
-            "--model".to_string(),
-            "{model}".to_string(),
-        ];
-        let (resolved, pass_stdin) = resolve_arg_templates(&args, "PROMPT_BODY", "model-x");
-        assert_eq!(resolved, vec!["-p", "PROMPT_BODY", "--model", "model-x"]);
-        assert!(!pass_stdin);
-    }
-
-    #[test]
     fn pr_mode_drops_findings_outside_changed_lines() {
         let diff = r#"diff --git a/src/lib.rs b/src/lib.rs
 --- a/src/lib.rs
@@ -2674,29 +2779,6 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
-    fn resolves_cli_command_defaults_and_custom_overrides() {
-        let cfg = LlmConfig {
-            cli_command: "custom-llm".to_string(),
-            cli_args: vec!["run".to_string(), "{prompt}".to_string()],
-            ..LlmConfig::default()
-        };
-
-        let (cmd, args) =
-            resolve_cli_command(&cfg, "codex-cli", true).expect("custom command should be used");
-        assert_eq!(cmd, "custom-llm");
-        assert_eq!(args, vec!["run", "{prompt}"]);
-
-        let (cmd, args) =
-            resolve_cli_command(&cfg, "codex-cli", false).expect("default command should resolve");
-        assert_eq!(cmd, "codex");
-        assert_eq!(args, vec!["exec", "--json", "-"]);
-
-        let err = resolve_cli_command(&cfg, "unknown-provider", false)
-            .expect_err("unknown provider should fail");
-        assert!(err.to_string().contains("no default command"));
-    }
-
-    #[test]
     fn builds_system_prompt_with_optional_context_sections() {
         let pack = PromptPack {
             core_system: "core".to_string(),
@@ -2740,18 +2822,6 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
-    fn resolve_arg_templates_uses_stdin_when_prompt_placeholder_missing() {
-        let args = vec![
-            "--json".to_string(),
-            "--model".to_string(),
-            "{model}".to_string(),
-        ];
-        let (resolved, pass_stdin) = resolve_arg_templates(&args, "PROMPT_BODY", "model-x");
-        assert_eq!(resolved, vec!["--json", "--model", "model-x"]);
-        assert!(pass_stdin);
-    }
-
-    #[test]
     fn resolve_agent_runtimes_returns_default_when_no_agents_enabled() {
         let mut cfg = LlmConfig::default();
         for agent in &mut cfg.agents {
@@ -2775,9 +2845,10 @@ diff --git a/src/b.rs b/src/b.rs
                 enabled: true,
                 focus: "security focus".to_string(),
                 prompt_file: Some(prompt_file.to_string_lossy().to_string()),
-                provider: Some("gemini-cli".to_string()),
+                provider: Some("gemini-api".to_string()),
                 model: Some("gemini-2.5-pro".to_string()),
                 min_confidence: Some(0.9),
+                mcp: Vec::new(),
             }],
             ..LlmConfig::default()
         };
@@ -2786,7 +2857,7 @@ diff --git a/src/b.rs b/src/b.rs
         let _ = std::fs::remove_file(&prompt_file);
 
         assert_eq!(runtimes.len(), 1);
-        assert_eq!(runtimes[0].config.provider, "gemini-cli");
+        assert_eq!(runtimes[0].config.provider, "gemini-api");
         assert_eq!(runtimes[0].config.model, "gemini-2.5-pro");
         assert!(
             runtimes[0]
@@ -2873,92 +2944,6 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
-    fn run_cli_provider_covers_success_and_failure_modes() {
-        let prompts = PromptPack {
-            core_system: "core".to_string(),
-            mode_pr: "pr".to_string(),
-            mode_scan: "scan".to_string(),
-            output_contract: "contract".to_string(),
-        };
-
-        let mut cfg = LlmConfig {
-            provider: "codex-cli".to_string(),
-            cli_command: "sh".to_string(),
-            cli_args: vec!["-c".to_string(), "cat".to_string()],
-            provider_timeout_secs: 2,
-            ..LlmConfig::default()
-        };
-        let attempt = ProviderAttempt {
-            provider: "codex-cli".to_string(),
-            model: Some("model-z".to_string()),
-        };
-
-        let out = run_cli_provider(
-            &cfg,
-            &prompts,
-            ReviewMode::Scan,
-            "chunk text",
-            &attempt,
-            "",
-            "",
-        )
-        .expect("cat should echo stdin payload");
-        assert!(out.contains("Preferred model hint: model-z"));
-        assert!(out.contains("chunk text"));
-
-        cfg.cli_args = vec!["-c".to_string(), "echo boom >&2; exit 7".to_string()];
-        let err = run_cli_provider(
-            &cfg,
-            &prompts,
-            ReviewMode::Scan,
-            "chunk text",
-            &attempt,
-            "",
-            "",
-        )
-        .expect_err("non-zero exit should fail");
-        assert!(err.to_string().contains("failed"));
-
-        cfg.cli_args = vec!["-c".to_string(), "exit 0".to_string()];
-        let err = run_cli_provider(
-            &cfg,
-            &prompts,
-            ReviewMode::Scan,
-            "chunk text",
-            &attempt,
-            "",
-            "",
-        )
-        .expect_err("empty stdout should fail");
-        assert!(err.to_string().contains("returned empty output"));
-    }
-
-    #[test]
-    fn run_cli_provider_times_out_when_command_hangs() {
-        let prompts = PromptPack {
-            core_system: "core".to_string(),
-            mode_pr: "pr".to_string(),
-            mode_scan: "scan".to_string(),
-            output_contract: "contract".to_string(),
-        };
-        let cfg = LlmConfig {
-            provider: "codex-cli".to_string(),
-            cli_command: "sh".to_string(),
-            cli_args: vec!["-c".to_string(), "sleep 2".to_string()],
-            provider_timeout_secs: 1,
-            ..LlmConfig::default()
-        };
-        let attempt = ProviderAttempt {
-            provider: "codex-cli".to_string(),
-            model: Some("m".to_string()),
-        };
-
-        let err = run_cli_provider(&cfg, &prompts, ReviewMode::Scan, "chunk", &attempt, "", "")
-            .expect_err("sleep should timeout");
-        assert!(err.to_string().contains("timed out"));
-    }
-
-    #[test]
     fn writes_failed_attempt_artifacts_files() {
         let dir = unique_temp_file("artifact-dir", "tmp");
         let debug = DebugConfig {
@@ -3034,48 +3019,6 @@ diff --git a/src/b.rs b/src/b.rs
         }"#;
         let err = parse_envelope(empty_evidence).expect_err("empty evidence should fail");
         assert!(err.to_string().contains("must contain at least one entry"));
-    }
-
-    #[test]
-    fn run_provider_attempt_uses_cli_backend_successfully() {
-        let cfg = LlmConfig {
-            provider: "codex-cli".to_string(),
-            cli_command: "sh".to_string(),
-            cli_args: vec![
-                "-c".to_string(),
-                "printf '%s' \"$1\"".to_string(),
-                "_".to_string(),
-                "{prompt}".to_string(),
-            ],
-            provider_timeout_secs: 2,
-            ..LlmConfig::default()
-        };
-
-        let prompts = PromptPack {
-            core_system: "core".to_string(),
-            mode_pr: "pr".to_string(),
-            mode_scan: "scan".to_string(),
-            output_contract: "contract".to_string(),
-        };
-        let attempt = ProviderAttempt {
-            provider: "codex-cli".to_string(),
-            model: Some("model-k".to_string()),
-        };
-
-        let out = run_provider_attempt(
-            &cfg,
-            &prompts,
-            ReviewMode::Pr,
-            "chunk body",
-            &attempt,
-            "path ctx",
-            "agent ctx",
-        )
-        .expect("cli provider attempt should succeed");
-
-        assert!(out.contains("Preferred model hint: model-k"));
-        assert!(out.contains("chunk body"));
-        assert!(out.contains("contract"));
     }
 
     #[test]
@@ -3265,22 +3208,17 @@ diff --git a/src/b.rs b/src/b.rs
         let _lock = crate::test_global_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _no_proxy = EnvGuard::set("NO_PROXY", "*");
+        let _http_proxy = EnvGuard::set("HTTP_PROXY", "");
+        let _https_proxy = EnvGuard::set("HTTPS_PROXY", "");
+        let mut server = Server::new();
 
         let (dir, mut cfg) = write_prompt_files("judge-workflow");
         cfg.enabled = true;
-        cfg.provider = "codex-cli".to_string();
-        cfg.cli_command = "sh".to_string();
-        cfg.cli_args = vec![
-            "-c".to_string(),
-            "if printf '%s' \"$1\" | grep -q \"final review adjudicator\"; then \
-                 printf '%s' '{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"keep\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]}]}'; \
-             else \
-                 printf '%s' '{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"keep\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]},{\"rule\":\"r2\",\"severity\":\"warning\",\"title\":\"drop\",\"details\":\"d2\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e2\"]}]}'; \
-             fi"
-                .to_string(),
-            "_".to_string(),
-            "{prompt}".to_string(),
-        ];
+        cfg.provider = "openai-api".to_string();
+        cfg.base_url = server.url();
+        cfg.api_key_env = "PATH".to_string();
+        cfg.provider_timeout_secs = 2;
         cfg.max_prompt_chars = 10_000;
         cfg.max_chunks = 1;
         cfg.agents.clear();
@@ -3288,6 +3226,24 @@ diff --git a/src/b.rs b/src/b.rs
         let judge_prompt = dir.join("judge.txt");
         std::fs::write(&judge_prompt, "adjudicate findings").expect("write judge prompt");
         cfg.judge_prompt_file = judge_prompt.to_string_lossy().to_string();
+        let _initial = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex("File: src/lib.rs".to_string()))
+            .expect(1)
+            .with_status(200)
+            .with_body(
+                r#"{"choices":[{"message":{"content":"{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"keep\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]},{\"rule\":\"r2\",\"severity\":\"warning\",\"title\":\"drop\",\"details\":\"d2\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e2\"]}]}"}}]}"#,
+            )
+            .create();
+        let _judge = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex("final review adjudicator".to_string()))
+            .expect(1)
+            .with_status(200)
+            .with_body(
+                r#"{"choices":[{"message":{"content":"{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"keep\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]}]}"}}]}"#,
+            )
+            .create();
 
         let diff = parse_unified_diff(
             r#"diff --git a/src/lib.rs b/src/lib.rs
@@ -3319,24 +3275,17 @@ diff --git a/src/b.rs b/src/b.rs
         let _lock = crate::test_global_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _no_proxy = EnvGuard::set("NO_PROXY", "*");
+        let _http_proxy = EnvGuard::set("HTTP_PROXY", "");
+        let _https_proxy = EnvGuard::set("HTTPS_PROXY", "");
+        let mut server = Server::new();
 
         let (dir, mut cfg) = write_prompt_files("debate-workflow");
         cfg.enabled = true;
-        cfg.provider = "codex-cli".to_string();
-        cfg.cli_command = "sh".to_string();
-        cfg.cli_args = vec![
-            "-c".to_string(),
-            "if printf '%s' \"$1\" | grep -q \"structured debate adjudication pass\"; then \
-                 printf '%s' '{\"findings\":[{\"rule\":\"r2\",\"severity\":\"warning\",\"title\":\"challenger-pick\",\"details\":\"d2\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e2\"]}]}'; \
-             elif printf '%s' \"$1\" | grep -q \"final review adjudicator\"; then \
-                 printf '%s' '{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"proposal-pick\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]}]}'; \
-             else \
-                 printf '%s' '{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"proposal-pick\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]},{\"rule\":\"r2\",\"severity\":\"warning\",\"title\":\"challenger-pick\",\"details\":\"d2\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e2\"]}]}'; \
-             fi"
-                .to_string(),
-            "_".to_string(),
-            "{prompt}".to_string(),
-        ];
+        cfg.provider = "openai-api".to_string();
+        cfg.base_url = server.url();
+        cfg.api_key_env = "PATH".to_string();
+        cfg.provider_timeout_secs = 2;
         cfg.max_prompt_chars = 10_000;
         cfg.max_chunks = 1;
         cfg.agents.clear();
@@ -3347,6 +3296,35 @@ diff --git a/src/b.rs b/src/b.rs
         std::fs::write(&debate_prompt, "debate phase prompt").expect("write debate prompt");
         cfg.judge_prompt_file = judge_prompt.to_string_lossy().to_string();
         cfg.debate_prompt_file = debate_prompt.to_string_lossy().to_string();
+        let _initial = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex("File: src/lib.rs".to_string()))
+            .expect(1)
+            .with_status(200)
+            .with_body(
+                r#"{"choices":[{"message":{"content":"{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"proposal-pick\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]},{\"rule\":\"r2\",\"severity\":\"warning\",\"title\":\"challenger-pick\",\"details\":\"d2\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e2\"]}]}"}}]}"#,
+            )
+            .create();
+        let _judge = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex("final review adjudicator".to_string()))
+            .expect(1)
+            .with_status(200)
+            .with_body(
+                r#"{"choices":[{"message":{"content":"{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"proposal-pick\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]}]}"}}]}"#,
+            )
+            .create();
+        let _debate = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex(
+                "structured debate adjudication pass".to_string(),
+            ))
+            .expect(1)
+            .with_status(200)
+            .with_body(
+                r#"{"choices":[{"message":{"content":"{\"findings\":[{\"rule\":\"r2\",\"severity\":\"warning\",\"title\":\"challenger-pick\",\"details\":\"d2\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e2\"]}]}"}}]}"#,
+            )
+            .create();
 
         let diff = parse_unified_diff(
             r#"diff --git a/src/lib.rs b/src/lib.rs
@@ -3378,24 +3356,17 @@ diff --git a/src/b.rs b/src/b.rs
         let _lock = crate::test_global_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _no_proxy = EnvGuard::set("NO_PROXY", "*");
+        let _http_proxy = EnvGuard::set("HTTP_PROXY", "");
+        let _https_proxy = EnvGuard::set("HTTPS_PROXY", "");
+        let mut server = Server::new();
 
         let (dir, mut cfg) = write_prompt_files("critique-revise-workflow");
         cfg.enabled = true;
-        cfg.provider = "codex-cli".to_string();
-        cfg.cli_command = "sh".to_string();
-        cfg.cli_args = vec![
-            "-c".to_string(),
-            "if printf '%s' \"$1\" | grep -q \"critique-and-revise adjudication pass\"; then \
-                 printf '%s' '{\"findings\":[{\"rule\":\"r2\",\"severity\":\"warning\",\"title\":\"revised-pick\",\"details\":\"d2\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e2\"]}]}'; \
-             elif printf '%s' \"$1\" | grep -q \"final review adjudicator\"; then \
-                 printf '%s' '{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"draft-pick\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]}]}'; \
-             else \
-                 printf '%s' '{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"draft-pick\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]},{\"rule\":\"r2\",\"severity\":\"warning\",\"title\":\"revised-pick\",\"details\":\"d2\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e2\"]}]}'; \
-             fi"
-                .to_string(),
-            "_".to_string(),
-            "{prompt}".to_string(),
-        ];
+        cfg.provider = "openai-api".to_string();
+        cfg.base_url = server.url();
+        cfg.api_key_env = "PATH".to_string();
+        cfg.provider_timeout_secs = 2;
         cfg.max_prompt_chars = 10_000;
         cfg.max_chunks = 1;
         cfg.agents.clear();
@@ -3406,6 +3377,35 @@ diff --git a/src/b.rs b/src/b.rs
         std::fs::write(&revise_prompt, "revise phase prompt").expect("write revise prompt");
         cfg.judge_prompt_file = judge_prompt.to_string_lossy().to_string();
         cfg.critique_revise_prompt_file = revise_prompt.to_string_lossy().to_string();
+        let _initial = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex("File: src/lib.rs".to_string()))
+            .expect(1)
+            .with_status(200)
+            .with_body(
+                r#"{"choices":[{"message":{"content":"{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"draft-pick\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]},{\"rule\":\"r2\",\"severity\":\"warning\",\"title\":\"revised-pick\",\"details\":\"d2\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e2\"]}]}"}}]}"#,
+            )
+            .create();
+        let _judge = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex("final review adjudicator".to_string()))
+            .expect(1)
+            .with_status(200)
+            .with_body(
+                r#"{"choices":[{"message":{"content":"{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"draft-pick\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]}]}"}}]}"#,
+            )
+            .create();
+        let _critique = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex(
+                "critique-and-revise adjudication pass".to_string(),
+            ))
+            .expect(1)
+            .with_status(200)
+            .with_body(
+                r#"{"choices":[{"message":{"content":"{\"findings\":[{\"rule\":\"r2\",\"severity\":\"warning\",\"title\":\"revised-pick\",\"details\":\"d2\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e2\"]}]}"}}]}"#,
+            )
+            .create();
 
         let diff = parse_unified_diff(
             r#"diff --git a/src/lib.rs b/src/lib.rs
@@ -3437,24 +3437,17 @@ diff --git a/src/b.rs b/src/b.rs
         let _lock = crate::test_global_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _no_proxy = EnvGuard::set("NO_PROXY", "*");
+        let _http_proxy = EnvGuard::set("HTTP_PROXY", "");
+        let _https_proxy = EnvGuard::set("HTTPS_PROXY", "");
+        let mut server = Server::new();
 
         let (dir, mut cfg) = write_prompt_files("debate-empty-first-pass");
         cfg.enabled = true;
-        cfg.provider = "codex-cli".to_string();
-        cfg.cli_command = "sh".to_string();
-        cfg.cli_args = vec![
-            "-c".to_string(),
-            "if printf '%s' \"$1\" | grep -q \"structured debate adjudication pass\"; then \
-                 printf '%s' 'not-json'; \
-             elif printf '%s' \"$1\" | grep -q \"final review adjudicator\"; then \
-                 printf '%s' '{\"findings\":[]}'; \
-             else \
-                 printf '%s' '{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"base-1\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]},{\"rule\":\"r2\",\"severity\":\"warning\",\"title\":\"base-2\",\"details\":\"d2\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e2\"]}]}'; \
-             fi"
-                .to_string(),
-            "_".to_string(),
-            "{prompt}".to_string(),
-        ];
+        cfg.provider = "openai-api".to_string();
+        cfg.base_url = server.url();
+        cfg.api_key_env = "PATH".to_string();
+        cfg.provider_timeout_secs = 2;
         cfg.max_prompt_chars = 10_000;
         cfg.max_chunks = 1;
         cfg.agents.clear();
@@ -3465,6 +3458,31 @@ diff --git a/src/b.rs b/src/b.rs
         std::fs::write(&debate_prompt, "debate phase prompt").expect("write debate prompt");
         cfg.judge_prompt_file = judge_prompt.to_string_lossy().to_string();
         cfg.debate_prompt_file = debate_prompt.to_string_lossy().to_string();
+        let _initial = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex("File: src/lib.rs".to_string()))
+            .expect(1)
+            .with_status(200)
+            .with_body(
+                r#"{"choices":[{"message":{"content":"{\"findings\":[{\"rule\":\"r1\",\"severity\":\"warning\",\"title\":\"base-1\",\"details\":\"d1\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e1\"]},{\"rule\":\"r2\",\"severity\":\"warning\",\"title\":\"base-2\",\"details\":\"d2\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e2\"]}]}"}}]}"#,
+            )
+            .create();
+        let _judge = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex("final review adjudicator".to_string()))
+            .expect(1)
+            .with_status(200)
+            .with_body(r#"{"choices":[{"message":{"content":"{\"findings\":[]}"}}]}"#)
+            .create();
+        let _debate = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex(
+                "structured debate adjudication pass".to_string(),
+            ))
+            .expect(1)
+            .with_status(200)
+            .with_body(r#"{"choices":[{"message":{"content":"not-json"}}]}"#)
+            .create();
 
         let diff = parse_unified_diff(
             r#"diff --git a/src/lib.rs b/src/lib.rs
@@ -3531,21 +3549,56 @@ diff --git a/src/b.rs b/src/b.rs
         let _lock = crate::test_global_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _no_proxy = EnvGuard::set("NO_PROXY", "*");
+        let _http_proxy = EnvGuard::set("HTTP_PROXY", "");
+        let _https_proxy = EnvGuard::set("HTTPS_PROXY", "");
+        let mut server = Server::new();
 
         let (dir, mut cfg) = write_prompt_files("run-llm-review");
         cfg.enabled = true;
-        cfg.provider = "codex-cli".to_string();
-        cfg.cli_command = "sh".to_string();
-        cfg.cli_args = vec![
-            "-c".to_string(),
-            "printf '%s' '{\"findings\":[{\"rule\":\"r\",\"severity\":\"warning\",\"title\":\"t\",\"details\":\"d\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e\"]}]}'"
-                .to_string(),
-            "_".to_string(),
-            "{prompt}".to_string(),
-        ];
+        cfg.provider = "openai-api".to_string();
+        cfg.base_url = server.url();
+        cfg.api_key_env = "PATH".to_string();
+        cfg.provider_timeout_secs = 2;
         cfg.max_prompt_chars = 10_000;
         cfg.max_chunks = 1;
         cfg.agents.clear();
+        let _review_ok = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex("File: src/lib.rs".to_string()))
+            .expect(1)
+            .with_status(200)
+            .with_body(
+                r#"{"choices":[{"message":{"content":"{\"findings\":[{\"rule\":\"r\",\"severity\":\"warning\",\"title\":\"t\",\"details\":\"d\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e\"]}]}"}}]}"#,
+            )
+            .create();
+        let _probe_ok = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex(
+                "Probe request: return a valid JSON envelope".to_string(),
+            ))
+            .expect(1)
+            .with_status(200)
+            .with_body(r#"{"choices":[{"message":{"content":"{\"findings\":[]}"}}]}"#)
+            .create();
+        let _probe_bad = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex(
+                "Probe request: return a valid JSON envelope".to_string(),
+            ))
+            .expect(1)
+            .with_status(200)
+            .with_body(r#"{"choices":[{"message":{"content":"not-json"}}]}"#)
+            .create();
+        let _partial_ok = server
+            .mock("POST", "/chat/completions")
+            .match_body(Matcher::Regex("File: src/lib.rs".to_string()))
+            .expect(1)
+            .with_status(200)
+            .with_body(
+                r#"{"choices":[{"message":{"content":"{\"findings\":[{\"rule\":\"bad\",\"severity\":\"warning\",\"title\":\"x\",\"details\":\"y\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e\"]}]}"}}]}"#,
+            )
+            .create();
 
         let diff = parse_unified_diff(
             r#"diff --git a/src/lib.rs b/src/lib.rs
@@ -3570,25 +3623,11 @@ diff --git a/src/b.rs b/src/b.rs
 
         probe_provider(&cfg).expect("probe should succeed");
 
-        cfg.cli_args = vec![
-            "-c".to_string(),
-            "printf '%s' 'not-json'".to_string(),
-            "_".to_string(),
-            "{prompt}".to_string(),
-        ];
         let err = probe_provider(&cfg).expect_err("invalid probe response should fail");
         assert!(
             err.to_string()
                 .contains("provider probe output was not valid findings JSON")
         );
-
-        cfg.cli_args = vec![
-            "-c".to_string(),
-            "printf '%s' '{\"findings\":[{\"rule\":\"bad\",\"severity\":\"warning\",\"title\":\"x\",\"details\":\"y\",\"file\":\"src/lib.rs\",\"line\":1,\"confidence\":0.9,\"suggestion\":null,\"evidence\":[\"e\"]}]}'"
-                .to_string(),
-            "_".to_string(),
-            "{prompt}".to_string(),
-        ];
         cfg.agents = vec![
             LlmAgentConfig {
                 name: "bad-agent".to_string(),
@@ -3598,15 +3637,17 @@ diff --git a/src/b.rs b/src/b.rs
                 provider: Some("not-supported".to_string()),
                 model: None,
                 min_confidence: None,
+                mcp: Vec::new(),
             },
             LlmAgentConfig {
                 name: "good-agent".to_string(),
                 enabled: true,
                 focus: "x".to_string(),
                 prompt_file: None,
-                provider: Some("codex-cli".to_string()),
+                provider: Some("openai-api".to_string()),
                 model: None,
                 min_confidence: None,
+                mcp: Vec::new(),
             },
         ];
 
@@ -3628,6 +3669,7 @@ diff --git a/src/b.rs b/src/b.rs
             provider: Some("not-supported".to_string()),
             model: None,
             min_confidence: None,
+            mcp: Vec::new(),
         }];
         let err = run_llm_review(
             &cfg,

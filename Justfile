@@ -114,7 +114,7 @@ ci:
 # Lint workflow definitions when actionlint is installed.
 workflow-lint:
   if command -v actionlint >/dev/null 2>&1; then \
-    actionlint .github/workflows/fantastic-pr.yml; \
+    actionlint examples/workflows/fantastic-pr.yml; \
   else \
     echo "actionlint not installed; skipping"; \
   fi

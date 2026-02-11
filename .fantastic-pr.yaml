@@ -36,10 +36,12 @@ llm:
   base_url: https://api.openai.com/v1
   model: gpt-4.1-mini
   api_key_env: OPENAI_API_KEY
-  cli_command: ""
-  cli_args: []
   fallback_models: []
   fallback_providers: []
+  repo_skills:
+    enabled: false
+    max_files: 6
+    max_chars_per_file: 1600
   agents:
     - name: general
       enabled: true
@@ -48,6 +50,7 @@ llm:
       provider: null
       model: null
       min_confidence: null
+      mcp: []
     - name: security
       enabled: true
       focus: Focus on secrets, auth boundaries, injection, data exposure, and insecure defaults.
@@ -55,6 +58,7 @@ llm:
       provider: null
       model: null
       min_confidence: 0.75
+      mcp: []
     - name: maintainability
       enabled: true
       focus: Focus on testability, complexity risks, brittle abstractions, and long-term maintenance hazards.
@@ -62,6 +66,7 @@ llm:
       provider: null
       model: null
       min_confidence: null
+      mcp: []
   prompt_core_file: prompts/core_system.txt
   prompt_pr_file: prompts/mode_pr.txt
   prompt_scan_file: prompts/mode_scan.txt
