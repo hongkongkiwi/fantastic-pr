@@ -431,12 +431,16 @@ fn collect_existing_inline_markers(
 fn trusted_marker_authors() -> BTreeSet<String> {
     let mut out = BTreeSet::from(["github-actions[bot]".to_string()]);
     if let Ok(actor) = std::env::var("GITHUB_ACTOR") {
-        let actor = actor.trim();
-        if !actor.is_empty() {
-            out.insert(actor.to_ascii_lowercase());
+        let actor = actor.trim().to_ascii_lowercase();
+        if is_bot_login(&actor) {
+            out.insert(actor);
         }
     }
     out
+}
+
+fn is_bot_login(login: &str) -> bool {
+    login.ends_with("[bot]")
 }
 
 fn is_trusted_marker_author(user: Option<&UserInfo>, trusted_authors: &BTreeSet<String>) -> bool {
@@ -493,6 +497,8 @@ mod tests {
         build_inline_output_key, build_inline_output_marker, extract_inline_markers,
         publish_inline_comments_once_with_base, upsert_comment_with_base,
     };
+
+    use crate::test_utils::EnvGuard;
 
     fn test_ctx() -> PrContext {
         PrContext {
@@ -941,6 +947,11 @@ mod tests {
 
     #[test]
     fn inline_publish_ignores_markers_from_untrusted_authors() {
+        let _guard = crate::test_global_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _actor = EnvGuard::set("GITHUB_ACTOR", "octocat");
+
         let mut server = Server::new();
         let ctx = test_ctx();
         let key = build_inline_output_key(&ctx);
@@ -993,6 +1004,61 @@ mod tests {
                 .expect("publish should succeed");
         assert!(posted);
         post_mock.assert();
+    }
+
+    #[test]
+    fn inline_publish_honors_bot_actor_markers() {
+        let _guard = crate::test_global_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _actor = EnvGuard::set("GITHUB_ACTOR", "custom-app[bot]");
+
+        let mut server = Server::new();
+        let ctx = test_ctx();
+        let key = build_inline_output_key(&ctx);
+        let marker = build_inline_output_marker(&build_inline_comment_output_key(
+            &key,
+            &InlineComment {
+                rule: "r".to_string(),
+                path: "src/lib.rs".to_string(),
+                line: 10,
+                body: "body".to_string(),
+            },
+        ));
+
+        let _reviews = server
+            .mock("GET", "/repos/owner/repo/pulls/42/reviews")
+            .match_query(page_query(1))
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"body":"{}","user":{{"login":"custom-app[bot]"}}}}]"#,
+                marker
+            ))
+            .create();
+        let _review_comments = server
+            .mock("GET", "/repos/owner/repo/pulls/42/comments")
+            .match_query(page_query(1))
+            .with_status(200)
+            .with_body("[]")
+            .create();
+        let _issue_comments = server
+            .mock("GET", "/repos/owner/repo/issues/42/comments")
+            .match_query(page_query(1))
+            .with_status(200)
+            .with_body("[]")
+            .create();
+
+        let comments = vec![InlineComment {
+            rule: "r".to_string(),
+            path: "src/lib.rs".to_string(),
+            line: 10,
+            body: "body".to_string(),
+        }];
+
+        let posted =
+            publish_inline_comments_once_with_base("t", &ctx, &key, &comments, &server.url())
+                .expect("publish should succeed with skip");
+        assert!(!posted);
     }
 
     #[test]

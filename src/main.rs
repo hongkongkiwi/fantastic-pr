@@ -38,6 +38,48 @@ pub(crate) fn test_global_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+#[cfg(test)]
+mod test_utils {
+    use std::ffi::OsString;
+
+    /// RAII guard for temporarily setting an environment variable in tests.
+    /// Restores the previous value (or unsets if none) on drop.
+    pub(crate) struct EnvGuard {
+        key: String,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        pub(crate) fn set(key: &str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self {
+                key: key.to_string(),
+                previous,
+            }
+        }
+
+        pub(crate) fn unset(key: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self {
+                key: key.to_string(),
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = &self.previous {
+                unsafe { std::env::set_var(&self.key, prev) };
+            } else {
+                unsafe { std::env::remove_var(&self.key) };
+            }
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
 enum Mode {
     Auto,
@@ -743,7 +785,6 @@ mod tests {
     use clap::Parser;
     use mockito::{Matcher, Server};
     use std::collections::HashMap;
-    use std::ffi::OsString;
     use std::path::Path;
     use std::path::PathBuf;
     use std::process::Command;
@@ -826,40 +867,7 @@ mod tests {
         }
     }
 
-    struct EnvGuard {
-        key: String,
-        previous: Option<OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self {
-                key: key.to_string(),
-                previous,
-            }
-        }
-
-        fn unset(key: &str) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe { std::env::remove_var(key) };
-            Self {
-                key: key.to_string(),
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(prev) = &self.previous {
-                unsafe { std::env::set_var(&self.key, prev) };
-            } else {
-                unsafe { std::env::remove_var(&self.key) };
-            }
-        }
-    }
+    use crate::test_utils::EnvGuard;
 
     fn run_git(repo: &Path, args: &[&str]) {
         let output = Command::new("git")

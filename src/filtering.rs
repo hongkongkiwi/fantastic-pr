@@ -41,12 +41,12 @@ impl FileFilter {
             return false;
         }
 
-        source_ext(&norm).is_some_and(is_reviewable_ext) || is_reviewable_name(&norm)
+        source_ext(&norm).is_some_and(|ext| is_reviewable_ext(&ext)) || is_reviewable_name(&norm)
     }
 
     pub fn is_source_file(&self, path: &str) -> bool {
         let norm = normalize(path);
-        self.passes_path_filters(&norm) && source_ext(&norm).is_some_and(is_source_ext)
+        self.passes_path_filters(&norm) && source_ext(&norm).is_some_and(|ext| is_source_ext(&ext))
     }
 
     pub fn is_allowed_path(&self, path: &str) -> bool {
@@ -135,8 +135,12 @@ fn is_lockfile(path: &str) -> bool {
         || path.ends_with("go.sum")
 }
 
-fn source_ext(path: &str) -> Option<&str> {
-    path.rsplit('.').next().filter(|ext| *ext != path)
+fn source_ext(path: &str) -> Option<String> {
+    let (_, ext) = path.rsplit_once('.')?;
+    if ext.is_empty() {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
 }
 
 fn is_source_ext(ext: &str) -> bool {
@@ -214,5 +218,16 @@ mod tests {
     #[test]
     fn normalize_handles_mixed_separators() {
         assert_eq!(normalize("src/foo\\bar/baz"), "src/foo/bar/baz");
+    }
+
+    #[test]
+    fn filter_matches_extensions_case_insensitively() {
+        let filter = FileFilter::from_config(&FilterConfig::default()).expect("filter build");
+
+        assert!(filter.is_reviewable_file("src/lib.RS"));
+        assert!(filter.is_source_file("src/lib.RS"));
+        assert!(filter.is_reviewable_file("README.MD"));
+        assert!(filter.is_reviewable_file("src\\MAIN.CPP"));
+        assert!(filter.is_source_file("src\\MAIN.CPP"));
     }
 }

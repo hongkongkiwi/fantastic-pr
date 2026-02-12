@@ -2262,7 +2262,6 @@ mod tests {
         DebugConfig, LlmAgentConfig, LlmConfig, LlmWorkflowStrategy, PathInstruction, ReviewConfig,
     };
     use crate::diff::parse_unified_diff;
-    use std::ffi::OsString;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2320,31 +2319,7 @@ mod tests {
         }
     }
 
-    struct EnvGuard {
-        key: String,
-        previous: Option<OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self {
-                key: key.to_string(),
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(prev) = &self.previous {
-                unsafe { std::env::set_var(&self.key, prev) };
-            } else {
-                unsafe { std::env::remove_var(&self.key) };
-            }
-        }
-    }
+    use crate::test_utils::EnvGuard;
 
     #[test]
     fn parses_wrapped_json() {
